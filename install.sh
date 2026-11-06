@@ -2,9 +2,16 @@
 set -euo pipefail
 
 main() {
-    local repo="${1:-}" commit="${2:-}"
+    local repo="LauritzWu/sb-five" commit="d31f9f0c53a0cd104b1927b6a4d93fafe2703792"
+    if [[ "$#" -eq 2 ]]; then
+        repo="$1"
+        commit="$2"
+    elif [[ "$#" -ne 0 ]]; then
+        printf '用法：bash install.sh [所有者/仓库 40位Git提交号]\n' >&2
+        return 2
+    fi
     if [[ ! "$repo" =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$ ||
-          ! "$commit" =~ ^[a-fA-F0-9]{40}$ || "$#" -ne 2 ]]; then
+          ! "$commit" =~ ^[a-fA-F0-9]{40}$ ]]; then
         printf '用法：bash install.sh 所有者/仓库 40位Git提交号\n' >&2
         return 2
     fi

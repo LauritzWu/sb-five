@@ -4,13 +4,13 @@
 
 ## 从 GitHub 一行安装
 
-将 `sb` 和 `install.sh` 放到同一个公开 GitHub 仓库的根目录。取这两个文件所在提交的完整 40 位提交号。替换下面的仓库和提交号，再把整行粘贴到 VPS 的 Bash 终端。VPS 需要有 `curl`，入口会按需安装 Python 3。
+把下面整行粘贴到 VPS 的 Bash 终端。VPS 需要有 `curl`，入口会按需安装 Python 3。
 
 ```bash
-( repo='OWNER/REPO'; rev='40位提交号'; tmp=$(mktemp) && trap 'rm -f -- "$tmp"' EXIT && curl --proto '=https' --tlsv1.2 -fsSL "https://raw.githubusercontent.com/$repo/$rev/install.sh" -o "$tmp" && bash "$tmp" "$repo" "$rev" )
+bash <(curl -fsSL https://raw.githubusercontent.com/LauritzWu/sb-five/main/install.sh)
 ```
 
-一行命令会下载同一提交的脚本并打开交互菜单。也可以用下面的手动上传方式运行。
+安装入口会下载指定版本的主脚本并打开交互菜单。安装后输入 `sudo sb` 即可重新打开菜单。
 
 ## 手动安装与配置
 
