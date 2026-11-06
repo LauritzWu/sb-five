@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""Interactive five-protocol VPS manager for Ubuntu 24.04 and Debian 12."""
+
+import base64
+import copy
+import fcntl
+import hashlib
+import http.client
+import io
+import ipaddress
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import secrets
+import socket
+import ssl
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from urllib.parse import urlencode, quote
+from urllib.request import urlopen
+import uuid
+
+
+ROOT = Path("/etc/sb-five")
+WEB = Path("/var/www/sb-five")
+STATE = ROOT / "state.json"
+BACKUP = ROOT / "previous.json"
+CONFIG = ROOT / "server.json"
+NGINX = ROOT / "nginx.conf"
+BOX = "/usr/local/lib/sb-five/sing-box"
+TABLE = "sb_five_hop"
+NAMES = {
+    "vless": "VLESS Vision REALITY", "vmess": "VMess WS TLS",
+    "hysteria2": "Hysteria 2", "tuic": "TUIC v5", "anytls": "AnyTLS",
+}
+PORTS = dict(zip(NAMES, [443, 8444, 443, 10443, 9443]))
+UDP = {"hysteria2", "tuic"}
+BACKEND = 18443
+VERSION = "1.14.4"
+HASHES = {
+    "amd64": "699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968",
+    "arm64": "436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26",
+}
+
+
+def run(*args, capture=False, check=True, data=None):
+    return subprocess.run(args, check=check, text=True, input=data,
+                          stdout=subprocess.PIPE if capture else None)
+
+
+def write(path, value, mode=0o600):
+    path = Path(path)
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(value.encode() if isinstance(value, str) else value)
+        temp.chmod(mode)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def save(path, value, mode=0o600):
+    write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n", mode)
+
+
+def read(path):
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def choose(title, options):
+    print(f"\n{title}")
+    for i, label in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    while True:
+        answer = input("数字（0 返回）> ").strip()
+        if answer in {str(i) for i in range(len(options) + 1)}:
+            return int(answer)
+
+
+def hostname(prompt):
+    value = input(prompt).strip().lower().rstrip(".")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+        raise ValueError("请输入有效域名（国际化域名请用 Punycode）")
+    return value
+
+
+def number(prompt):
+    value = int(input(prompt).strip())
+    if not 1 <= value <= 65535:
+        raise ValueError("端口必须为 1–65535")
+    return value
+
+
+def port_free(port, udp=False, ipv6=False):
+    try:
+        family = socket.AF_INET6 if ipv6 else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM if udp else socket.SOCK_STREAM) as sock:
+            if ipv6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.bind(("::" if ipv6 else "0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+
+
+def reservations(state):
+    used = {(False, 80), (False, BACKEND)}
+    if state:
+        used.add((False, 443))
+        used.update((name in UDP, port) for name, port in state["ports"].items())
+        if state.get("hop"):
+            lo, hi = state["hop"]
+            used.update((True, port) for port in range(lo, hi + 1))
+    return used
+
+
+def available(state, old, name, port):
+    udp = name in UDP
+    if not udp and (port in {80, BACKEND} or (port == 443 and name != "vless")):
+        return False
+    if any(other != name and (other in UDP) == udp and value == port
+           for other, value in state["ports"].items()):
+        return False
+    if udp and state.get("hop") and state["hop"][0] <= port <= state["hop"][1]:
+        return False
+    return (old is not None and (udp, port) in reservations(old)) or port_free(port, udp, uses_ipv6(state))
+
+
+def node_addresses(state):
+    return state.get("addresses", {"ipv4": state["domain"]})
+
+
+def uses_ipv6(state):
+    return "ipv6" in node_addresses(state)
+
+
+def select_addresses(domain):
+    choice = choose("生成节点地址", ["IPv4", "IPv6", "IPv4 + IPv6"])
+    if not choice:
+        return None
+    families = {4, 6} if choice == 3 else {4 if choice == 1 else 6}
+    resolved = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(domain, 443)}
+    addresses = {}
+    for version in sorted(families):
+        candidates = sorted(ip for ip in resolved if ip.version == version and ip.is_global)
+        if not candidates:
+            record = "A" if version == 4 else "AAAA"
+            raise ValueError(f"{domain} 缺少可用的公网 {record} 记录")
+        index = choose(f"选择节点 IPv{version} 地址", list(map(str, candidates))) if len(candidates) > 1 else 1
+        if not index:
+            return None
+        address = str(candidates[index - 1])
+        if version == 6:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+                sock.bind((address, 0))
+        addresses[f"ipv{version}"] = address
+    if 6 not in families and any(ip.version == 6 for ip in resolved):
+        raise ValueError("IPv4 模式下请移除该子域名的 AAAA 记录，或选择 IPv4 + IPv6")
+    return addresses
+
+
+def select_port(state, old, name):
+    option = choose(NAMES[name], [f"默认 {PORTS[name]}", "手动输入", "随机空闲端口"])
+    if not option:
+        return None
+    if option == 3:
+        for _ in range(128):
+            port = 20000 + secrets.randbelow(40000)
+            if available(state, old, name, port):
+                return port
+        raise ValueError("没有找到空闲端口")
+    port = PORTS[name] if option == 1 else number("端口> ")
+    if not available(state, old, name, port):
+        raise ValueError(f"端口 {port} 已占用或保留")
+    return port
+
+
+def server_config(state):
+    cert, key = state["cert"]
+    tls = {"enabled": True, "certificate_path": cert, "key_path": key}
+    inbounds = []
+    for name, port in state["ports"].items():
+        secret = state["auth"][name]
+        inbound = {"type": name, "tag": name, "listen": "::" if uses_ipv6(state) else "0.0.0.0",
+                   "listen_port": port, "tls": tls}
+        if name == "vless":
+            target = state["target"]
+            inbound["tls"] = {"enabled": True, "server_name": target["sni"],
+                              "reality": {"enabled": True, "handshake": {
+                                  "server": target["host"], "server_port": target["port"]},
+                                  "private_key": state["private"], "short_id": [state["sid"]]}}
+            user = {"uuid": secret, "flow": "xtls-rprx-vision"}
+        elif name == "vmess":
+            inbound["transport"] = {"type": "ws", "path": state["ws"]}
+            user = {"uuid": secret, "alterId": 0}
+        elif name == "tuic":
+            user = {"uuid": secret, "password": state["tuic_password"]}
+            inbound["congestion_control"] = "bbr"
+            inbound["tls"] = dict(tls, alpn=["h3"])
+        else:
+            user = {"password": secret}
+        inbound["users"] = [dict(user, name="owner")]
+        inbounds.append(inbound)
+    route = {"final": "direct", "default_domain_resolver": "ipv4",
+             "rules": [{"action": "resolve", "server": "ipv4", "strategy": "ipv4_only"},
+                       {"ip_is_private": True, "action": "reject"},
+                       {"ip_version": 6, "action": "reject"}]}
+    if state["block_cn"]:
+        route["rule_set"] = [
+            {"type": "remote", "tag": f"{kind}-cn", "format": "binary",
+             "url": f"https://raw.githubusercontent.com/SagerNet/sing-{kind}/rule-set/{kind}-cn.srs",
+             "download_detour": "direct"}
+            for kind in ("geoip", "geosite")
+        ]
+        route["rules"].append({"rule_set": ["geoip-cn", "geosite-cn"], "action": "reject"})
+    return {"log": {"level": "warn"}, "inbounds": inbounds,
+            "dns": {"servers": [{"type": "local", "tag": "ipv4"}], "strategy": "ipv4_only"},
+            "route": route, "outbounds": [{"type": "direct", "tag": "direct"}],
+            "experimental": {"cache_file": {"enabled": True, "path": str(ROOT / "cache.db")}}}
+
+
+def exports(state, address=None):
+    domain = state["domain"]
+    address = address or next(iter(node_addresses(state).values()))
+    authority_host = f"[{address}]" if ":" in address else address
+    links, sing, clash = {}, [], []
+    for name in NAMES:
+        if name not in state["ports"]:
+            continue
+        port, password, label = state["ports"][name], state["auth"][name], NAMES[name]
+        tls = {"enabled": True, "server_name": domain}
+        sb = {"type": name, "tag": label, "server": address, "server_port": port, "tls": tls}
+        mh = {"type": name, "name": label,
+              "server": address, "port": port, "sni": domain}
+        authority = f"{quote(password, safe='')}@{authority_host}:{port}"
+        query = {"sni": domain}
+        if name == "vless":
+            sni, public, sid = state["target"]["sni"], state["public"], state["sid"]
+            query.update(sni=sni, encryption="none", flow="xtls-rprx-vision",
+                         security="reality", type="tcp", fp="chrome", pbk=public, sid=sid)
+            tls.update(server_name=sni, utls={"enabled": True, "fingerprint": "chrome"},
+                       reality={"enabled": True, "public_key": public, "short_id": sid})
+            sb.update(uuid=password, flow="xtls-rprx-vision")
+            mh.update(uuid=password, flow="xtls-rprx-vision", tls=True, servername=sni,
+                      network="tcp", udp=True, **{"client-fingerprint": "chrome",
+                      "reality-opts": {"public-key": public, "short-id": sid}})
+            mh.pop("sni")
+        elif name == "vmess":
+            path = state["ws"]
+            sb.update(uuid=password, security="auto", alter_id=0, transport={"type": "ws", "path": path})
+            mh.update(uuid=password, cipher="auto", alterId=0, network="ws", tls=True,
+                      servername=domain, udp=True, **{"ws-opts": {"path": path}})
+            mh.pop("sni")
+            payload = dict(v="2", ps=label, add=address, port=str(port), id=password,
+                           aid="0", scy="auto", net="ws", type="none", host=domain,
+                           path=path, tls="tls", sni=domain)
+            links[name] = "vmess://" + base64.b64encode(json.dumps(payload).encode()).decode()
+        elif name == "tuic":
+            auth = state["tuic_password"]
+            authority = f"{password}:{quote(auth, safe='')}@{authority_host}:{port}"
+            sb.update(uuid=password, password=auth, congestion_control="bbr", udp_relay_mode="native")
+            mh.update(uuid=password, password=auth, **{"congestion-controller": "bbr",
+                                                      "udp-relay-mode": "native"})
+            query.update(congestion_control="bbr", udp_relay_mode="native", alpn="h3")
+            tls["alpn"] = ["h3"]
+            mh["alpn"] = ["h3"]
+        else:
+            sb["password"] = mh["password"] = password
+            if name == "hysteria2" and state.get("hop"):
+                lo, hi = state["hop"]
+                sb.pop("server_port")
+                sb["server_ports"] = [f"{lo}:{hi}"]
+                mh["ports"] = f"{lo}-{hi}"
+                authority = f"{password}@{authority_host}:{lo}-{hi}"
+        if name not in links:
+            links[name] = f"{name}://{authority}?{urlencode(query)}#{quote(label)}"
+        sing.append(sb)
+        clash.append(mh)
+    tags = [item["tag"] for item in sing]
+    client = {"inbounds": [{"type": "mixed", "tag": "local", "listen": "127.0.0.1", "listen_port": 7890}],
+              "outbounds": [{"type": "selector", "tag": "Proxy", "outbounds": tags}] + sing,
+              "route": {"final": "Proxy"}}
+    mihomo = {"mixed-port": 7890, "allow-lan": False, "mode": "rule", "proxies": clash,
+              "proxy-groups": [{"name": "Proxy", "type": "select", "proxies": tags}],
+              "rules": ["MATCH,Proxy"]}
+    return links, client, mihomo
+
+
+def subscriptions(state):
+    files = {}
+    for family, address in node_addresses(state).items():
+        _, sing, clash = exports(state, address)
+        for name, config in (("sing-box.json", sing), ("mihomo.yaml", clash)):
+            files[f"{family}-{name}"] = config
+            files.setdefault(name, config)
+    return files
+
+
+def nginx_config(state):
+    domain = state["domain"]
+    http_v6 = "    listen [::]:80;\n" if uses_ipv6(state) else ""
+    site = f"""server {{
+    listen 80;
+{http_v6}    server_name {domain};
+    location ^~ /.well-known/acme-challenge/ {{ root {WEB}; }}
+    location / {{ return 301 https://{domain}$request_uri; }}
+}}"""
+    if not state.get("cert"):
+        return site + "\n"
+    cert, key = state["cert"]
+    listen = "" if state["ports"].get("vless") == 443 else "    listen 443 ssl;\n"
+    if listen and uses_ipv6(state):
+        listen += "    listen [::]:443 ssl;\n"
+    token = state["token"]
+    locations = "".join(f"""    location = /sub/{token}/{filename} {{
+        access_log off;
+        alias {WEB}/{filename};
+    }}
+""" for filename in subscriptions(state))
+    return site + f"""
+server {{
+    listen 127.0.0.1:{BACKEND} ssl;
+{listen}    server_name {domain};
+    http2 on;
+    ssl_certificate {cert};
+    ssl_certificate_key {key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Cache-Control "no-store";
+    location = / {{ root {WEB}; try_files /index.html =404; }}
+{locations}    location / {{ return 404; }}
+}}
+"""
+
+
+def set_nginx(state):
+    # Debian 12 ships nginx 1.22, which enables HTTP/2 on the listen directive.
+    content = nginx_config(state).replace("    http2 on;\n", "")
+    content = content.replace(f":{BACKEND} ssl;", f":{BACKEND} ssl http2;")
+    content = content.replace("listen 443 ssl;", "listen 443 ssl http2;")
+    content = content.replace("listen [::]:443 ssl;", "listen [::]:443 ssl http2;")
+    write(NGINX, content)
+    include = Path("/etc/nginx/conf.d/sb-five.conf")
+    write(include, f"include {NGINX};\n")
+    run("nginx", "-t")
+    run("systemctl", "restart", "nginx")
+
+
+def set_hop(state):
+    ruleset = run("nft", "list", "tables", capture=True).stdout.splitlines()
+    commands = [f"delete table {family} {TABLE}" for family in ("ip", "inet")
+                if f"table {family} {TABLE}" in ruleset]
+    if state and state.get("hop") and "hysteria2" in state["ports"]:
+        lo, hi = state["hop"]
+        family = "inet" if uses_ipv6(state) else "ip"
+        commands.extend([
+            f"add table {family} {TABLE}",
+            f"add chain {family} {TABLE} prerouting {{ type nat hook prerouting priority -100; policy accept; }}",
+            f"add rule {family} {TABLE} prerouting fib daddr type local udp dport {lo}-{hi} redirect to :{state['ports']['hysteria2']}",
+        ])
+    if commands:
+        run("nft", "-f", "-", data="\n".join(commands) + "\n")
+
+
+def validate_target(state):
+    target = state["target"]
+    addresses = {item[4][0] for item in socket.getaddrinfo(target["host"], target["port"])}
+    if any(ipaddress.ip_address(ip).is_loopback for ip in addresses) and target["port"] != BACKEND:
+        if target["port"] in state["ports"].values():
+            raise ValueError("REALITY 目标绕回了代理监听端口")
+    if not target["managed"]:
+        if target["host"] == state["domain"] and target["port"] == state["ports"].get("vless"):
+            raise ValueError("REALITY 目标与公网入口相同")
+        tls = ssl.create_default_context()
+        tls.minimum_version = ssl.TLSVersion.TLSv1_3
+        tls.set_alpn_protocols(["h2"])
+        with socket.create_connection((target["host"], target["port"]), timeout=8) as sock:
+            with tls.wrap_socket(sock, server_hostname=target["sni"]) as conn:
+                if conn.selected_alpn_protocol() != "h2":
+                    raise ValueError("目标未协商 HTTP/2")
+
+
+def check_website(state, path="/", host="127.0.0.1"):
+    domain = state["domain"]
+    conn = http.client.HTTPSConnection(domain, timeout=4)
+    conn._create_connection = lambda address, timeout, source: socket.create_connection(
+        (host, 443), timeout, source)
+    try:
+        conn.request("GET", path)
+        if conn.getresponse().status != 200:
+            raise ValueError("HTTPS 首页或订阅不可读")
+    finally:
+        conn.close()
+
+
+def apply(state, old):
+    if not state["ports"]:
+        raise ValueError("请至少启用一个协议")
+    if state["ports"].get("vless") == 443 and not state["target"]["managed"]:
+        raise ValueError("使用外部目标时，请为 VLESS 选择非 443 端口，以保留本机 HTTPS 订阅")
+    validate_target(state)
+    candidate = ROOT / "candidate.json"
+    save(candidate, server_config(state))
+    try:
+        run(BOX, "check", "-c", str(candidate))
+    finally:
+        candidate.unlink(missing_ok=True)
+    try:
+        # 443 can move between nginx and sing-box during a port change.
+        run("systemctl", "stop", "sb-five.service", check=False)
+        set_nginx(state)
+        save(CONFIG, server_config(state))
+        run("systemctl", "restart", "sb-five.service")
+        for attempt in range(5):
+            try:
+                check_website(state)
+                break
+            except (OSError, http.client.HTTPException):
+                if attempt == 4:
+                    raise
+                time.sleep(0.4)
+        run("systemctl", "is-active", "--quiet", "sb-five.service")
+        set_hop(state)
+        for filename, config in subscriptions(state).items():
+            save(WEB / filename, config, 0o640)
+            url = f"/sub/{state['token']}/{filename}"
+            check_website(state, url)
+            if uses_ipv6(state):
+                check_website(state, url, "::1")
+        if old:
+            save(BACKUP, old)
+        save(STATE, state)
+    except (Exception, KeyboardInterrupt):
+        if old:
+            run("systemctl", "stop", "sb-five.service", check=False)
+            set_nginx(old)
+            save(CONFIG, server_config(old))
+            run("systemctl", "start", "sb-five.service")
+            set_hop(old)
+            for filename, config in subscriptions(old).items():
+                save(WEB / filename, config, 0o640)
+        else:
+            run("systemctl", "stop", "sb-five.service", check=False)
+            set_hop(None)
+            set_nginx({"domain": state["domain"], "addresses": node_addresses(state)})
+        raise
+
+
+def setup(state):
+    release = platform.freedesktop_os_release()
+    if (release["ID"], release["VERSION_ID"]) not in {("ubuntu", "24.04"), ("debian", "12")}:
+        raise ValueError("此版本支持 Ubuntu 24.04 或 Debian 12")
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    if not arch:
+        raise ValueError("仅支持 amd64 和 arm64")
+    include = Path("/etc/nginx/conf.d/sb-five.conf")
+    if not STATE.exists() and not include.exists():
+        if not all(port_free(port, ipv6=uses_ipv6(state)) for port in (80, 443, BACKEND)):
+            raise ValueError("首次安装需要 TCP 80、443、18443 空闲")
+        if Path("/usr/local/bin/sb").exists():
+            raise ValueError("检测到已有 /usr/local/bin/sb，请使用全新 VPS")
+    if not Path(BOX).exists():
+        run("apt-get", "update")
+        run("apt-get", "install", "-y", "nginx", "certbot", "qrencode", "openssl", "nftables")
+        filename = f"sing-box-{VERSION}-linux-{arch}"
+        url = f"https://github.com/SagerNet/sing-box/releases/download/v{VERSION}/{filename}.tar.gz"
+        with urlopen(url, timeout=60) as response:
+            archive = response.read()
+        if hashlib.sha256(archive).hexdigest() != HASHES[arch]:
+            raise ValueError("sing-box 下载文件校验失败")
+        Path(BOX).parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+            with bundle.extractfile(f"{filename}/sing-box") as binary:
+                write(BOX, binary.read(), 0o755)
+    WEB.mkdir(parents=True, exist_ok=True)
+    os.chown(WEB, 0, web_group())
+    WEB.chmod(0o750)
+    if not (WEB / "index.html").exists():
+        write(WEB / "index.html", "<!doctype html><meta charset=utf-8><title>Home</title><h1>Welcome</h1>\n", 0o640)
+    if (WEB / "index.html").stat().st_gid != web_group():
+        os.chown(WEB / "index.html", 0, web_group())
+    WEB.chmod(0o2750)
+    default = Path("/etc/nginx/sites-enabled/default")
+    if default.is_symlink() and os.readlink(default) == "/etc/nginx/sites-available/default":
+        default.unlink()
+    write(Path("/usr/local/bin/sb"), Path(__file__).read_bytes(), 0o755)
+    write(Path("/etc/systemd/system/sb-five.service"), f"""[Unit]
+Description=Sing-box five-protocol VPS
+Wants=network-online.target
+After=network-online.target nginx.service
+
+[Service]
+ExecStart={BOX} run -c {CONFIG}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+""", 0o644)
+    write(Path("/etc/systemd/system/sb-five-hop.service"), """[Unit]
+Description=Restore sb-five UDP port redirection
+After=network-online.target nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sb --restore-hop
+
+[Install]
+WantedBy=multi-user.target
+""", 0o644)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "enable", "nginx", "sb-five.service", "sb-five-hop.service")
+    run("systemctl", "start", "nginx")
+
+
+def web_group():
+    import grp
+    return grp.getgrnam("www-data").gr_gid
+
+
+def certificate(state, option):
+    domain = state["domain"]
+    if option == 1:
+        email = input("ACME 邮箱> ").strip()
+        if "@" not in email or email.startswith("-"):
+            raise ValueError("请输入有效邮箱")
+        name = f"sb-five-{domain}"
+        run("certbot", "certonly", "--webroot", "-w", str(WEB), "--cert-name", name,
+            "-d", domain, "--email", email, "--agree-tos", "--non-interactive")
+        hook_dir = Path("/etc/letsencrypt/renewal-hooks/deploy")
+        hook_dir.mkdir(parents=True, exist_ok=True)
+        write(hook_dir / "sb-five-nginx", f"""#!/bin/sh
+[ "$RENEWED_LINEAGE" = /etc/letsencrypt/live/{name} ] || exit 0
+nginx -t && systemctl reload nginx && systemctl try-restart sb-five.service
+""", 0o755)
+        run("systemctl", "enable", "--now", "certbot.timer")
+        return [f"/etc/letsencrypt/live/{name}/{file}" for file in ("fullchain.pem", "privkey.pem")]
+    source = [Path(input(f"{label}的绝对路径> ").strip()) for label in ("完整证书链", "私钥")]
+    if not all(path.is_absolute() and path.is_file() for path in source):
+        raise ValueError("需要可读的绝对文件路径")
+    prefix = secrets.token_hex(8)
+    dest = [ROOT / f"{prefix}-{label}.pem" for label in ("cert", "key")]
+    for src, dst in zip(source, dest):
+        write(dst, src.read_bytes())
+    run("openssl", "x509", "-in", str(dest[0]), "-noout", "-checkend", "0")
+    result = run("openssl", "x509", "-in", str(dest[0]), "-noout", "-checkhost", domain, capture=True)
+    if "does match" not in result.stdout:
+        raise ValueError("证书与域名不匹配")
+    return list(map(str, dest))
+
+
+def managed(domain):
+    return {"host": "127.0.0.1", "port": BACKEND, "sni": domain, "managed": True}
+
+
+def select_target(domain):
+    selection = choose("REALITY 伪装目标", ["本脚本创建的同机 HTTPS 网站", "手动填写 HTTPS 后端"])
+    if selection == 1:
+        return managed(domain)
+    if selection == 2:
+        host = input("后端 IPv4 或域名> ").strip()
+        return {"host": host, "port": number("后端端口> "),
+                "sni": hostname("证书域名（SNI）> "), "managed": False}
+    return None
+
+
+def show(state):
+    for family, address in node_addresses(state).items():
+        links, _, _ = exports(state, address)
+        print(f"\n{family.upper()} 节点 · {address}")
+        for name, link in links.items():
+            print(f"\n{NAMES[name]}\n{link}", flush=True)
+            run("qrencode", "-t", "ANSIUTF8", "-m", "2", data=link)
+    url = f"https://{state['domain']}/sub/{state['token']}"
+    print(f"\n默认聚合订阅（原地址）\nsing-box  {url}/sing-box.json\nMihomo    {url}/mihomo.yaml")
+    for family in state.get("addresses", {}):
+        print(f"\n{family.upper()} 聚合订阅\nsing-box  {url}/{family}-sing-box.json\nMihomo    {url}/{family}-mihomo.yaml")
+    print("链接和二维码包含连接凭据，请妥善保存。")
+
+
+def install():
+    domain = hostname("节点子域名（A / AAAA 指向 VPS，关闭 CDN 代理）> ")
+    addresses = select_addresses(domain)
+    if addresses is None:
+        return
+    print("请先确认云防火墙放行 TCP 80/443。脚本会安装系统软件并管理 nginx。")
+    option = choose("继续安装", ["继续"])
+    if not option:
+        return
+    state = {
+        "domain": domain, "addresses": addresses, "ports": {}, "target": managed(domain), "hop": None,
+        "block_cn": True,
+        "sid": secrets.token_hex(8), "token": secrets.token_urlsafe(24),
+        "ws": "/" + secrets.token_hex(12), "tuic_password": secrets.token_urlsafe(24),
+        "auth": {name: str(uuid.uuid4()) if name in {"vless", "vmess", "tuic"}
+                 else secrets.token_urlsafe(24) for name in NAMES},
+    }
+    selected = choose("启用协议", ["全部五个"] + list(NAMES.values()))
+    if not selected:
+        return
+    for name in (list(NAMES) if selected == 1 else [list(NAMES)[selected - 2]]):
+        port = select_port(state, None, name)
+        if port is None:
+            return
+        state["ports"][name] = port
+    if "vless" in state["ports"]:
+        target = select_target(domain)
+        if target is None:
+            return
+        state["target"] = target
+        if state["ports"]["vless"] == 443 and not target["managed"]:
+            raise ValueError("外部目标模式需要 VLESS 使用非 443 端口")
+        validate_target(state)
+    cert_option = choose("证书", ["ACME 自动签发", "导入现有证书"])
+    if not cert_option:
+        return
+    setup(state)
+    pairs = run(BOX, "generate", "reality-keypair", capture=True).stdout.splitlines()
+    keys = {label.strip().lower().replace(" ", ""): value.strip()
+            for label, value in (line.split(":", 1) for line in pairs if ":" in line)}
+    state.update(private=keys["privatekey"], public=keys["publickey"])
+    set_nginx(state)
+    state["cert"] = certificate(state, cert_option)
+    apply(state, None)
+    show(state)
+
+
+def edit(state, action):
+    updated = copy.deepcopy(state)
+    if action == 1:
+        names = list(NAMES)
+        index = choose("启用、改端口或停用协议",
+                       [f"{NAMES[name]} [{state['ports'].get(name, '关闭')}]" for name in names])
+        if not index:
+            return
+        name = names[index - 1]
+        selection = choose(NAMES[name], ["启用 / 改端口", "停用"])
+        if not selection:
+            return
+        if selection == 1:
+            port = select_port(updated, state, name)
+            if port is None:
+                return
+            updated["ports"][name] = port
+        else:
+            updated["ports"].pop(name, None)
+            if name == "hysteria2":
+                updated["hop"] = None
+    elif action == 2:
+        target = select_target(state["domain"])
+        if target is None:
+            return
+        updated["target"] = target
+    elif action == 3:
+        selection = choose("证书", ["ACME 自动签发 / 续期", "导入现有证书"])
+        if not selection:
+            return
+        updated["cert"] = certificate(state, selection)
+    elif action == 4:
+        if "hysteria2" not in state["ports"]:
+            raise ValueError("请先启用 Hysteria 2")
+        selection = choose("Hysteria 2 端口跳跃", ["指定 UDP 范围", "关闭"])
+        if not selection:
+            return
+        if selection == 1:
+            lo, hi = number("起始端口> "), number("结束端口> ")
+            if not 1024 <= lo < hi or hi - lo >= 100:
+                raise ValueError("范围需要从 1024 以上开始，包含 2–100 个端口")
+            for port in range(lo, hi + 1):
+                if port in [state["ports"].get(name) for name in UDP] or not port_free(port, True, uses_ipv6(state)):
+                    raise ValueError(f"UDP {port} 与已有监听冲突")
+            updated["hop"] = [lo, hi]
+        else:
+            updated["hop"] = None
+    elif action == 5:
+        selection = choose("大陆目的地规则", ["拒绝命中中国大陆域名/IP 规则的流量", "关闭大陆规则"])
+        if not selection:
+            return
+        updated["block_cn"] = selection == 1
+    elif action == 9:
+        updated = read(BACKUP)
+        if not updated:
+            raise ValueError("没有上一份配置")
+    elif action == 10:
+        addresses = select_addresses(state["domain"])
+        if addresses is None:
+            return
+        updated["addresses"] = addresses
+    apply(updated, state)
+    print("配置已保存。")
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("请使用 sudo 运行。")
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (ROOT / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if sys.argv[1:] == ["--restore-hop"]:
+            set_hop(read(STATE))
+            return
+        if len(sys.argv) != 1:
+            sys.exit("用法：sudo sb")
+        installed = Path("/usr/local/bin/sb")
+        if STATE.exists() and Path(__file__).resolve() != installed:
+            write(installed, Path(__file__).read_bytes(), 0o755)
+        while True:
+            try:
+                state = read(STATE)
+                if not state:
+                    install()
+                    return
+                action = choose(f"sb-five · {state['domain']}", [
+                    "启用协议 / 改端口 / 停用", "设置 REALITY 目标", "管理证书",
+                    "Hysteria 2 端口跳跃", "IPv4 直出 / 大陆目的地规则",
+                    "查看链接 / 二维码 / 聚合订阅", "检查服务与配置", "查看日志",
+                    "回滚到上一份配置", "切换 IPv4 / IPv6 节点生成模式",
+                ])
+                if not action:
+                    return
+                if action == 6:
+                    show(state)
+                elif action == 7:
+                    run(BOX, "check", "-c", str(CONFIG))
+                    run("systemctl", "status", "--no-pager", "sb-five.service", "nginx")
+                    print("当前端口：", state["ports"], "跳跃：", state["hop"])
+                elif action == 8:
+                    run("journalctl", "-u", "sb-five.service", "-n", "60", "--no-pager")
+                else:
+                    edit(state, action)
+            except (OSError, ValueError, http.client.HTTPException, subprocess.CalledProcessError) as error:
+                print(f"操作未完成：{error}", file=sys.stderr)
+                if not STATE.exists():
+                    sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        print("\n退出。")
+    except BlockingIOError:
+        sys.exit("另一个 sb 进程正在操作。")
