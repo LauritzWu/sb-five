@@ -524,15 +524,30 @@ def web_group():
     return grp.getgrnam("www-data").gr_gid
 
 
+def acme_contact():
+    selection = choose("ACME 联系邮箱", ["填写自己的邮箱或可收信的邮箱别名", "不登记邮箱"])
+    if selection == 0:
+        return None
+    if selection == 2:
+        return ["--register-unsafely-without-email"]
+    while True:
+        email = input("ACME 邮箱（输入 0 返回）> ").strip()
+        if email == "0":
+            return None
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._%+\-]*@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", email):
+            return ["--email", email]
+        print("邮箱格式有误，请重新输入，例如 name@example.com。")
+
+
 def certificate(state, option):
     domain = state["domain"]
     if option == 1:
-        email = input("ACME 邮箱> ").strip()
-        if "@" not in email or email.startswith("-"):
-            raise ValueError("请输入有效邮箱")
+        contact = acme_contact()
+        if contact is None:
+            return None
         name = f"sb-five-{domain}"
         run("certbot", "certonly", "--webroot", "-w", str(WEB), "--cert-name", name,
-            "-d", domain, "--email", email, "--agree-tos", "--non-interactive")
+            "-d", domain, *contact, "--agree-tos", "--non-interactive")
         hook_dir = Path("/etc/letsencrypt/renewal-hooks/deploy")
         hook_dir.mkdir(parents=True, exist_ok=True)
         write(hook_dir / "sb-five-nginx", f"""#!/bin/sh
@@ -627,6 +642,8 @@ def install():
     state.update(private=keys["privatekey"], public=keys["publickey"])
     set_nginx(state)
     state["cert"] = certificate(state, cert_option)
+    if state["cert"] is None:
+        return
     apply(state, None)
     show(state)
 
@@ -662,6 +679,8 @@ def edit(state, action):
         if not selection:
             return
         updated["cert"] = certificate(state, selection)
+        if updated["cert"] is None:
+            return
     elif action == 4:
         if "hysteria2" not in state["ports"]:
             raise ValueError("请先启用 Hysteria 2")

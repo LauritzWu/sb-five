@@ -17,7 +17,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LauritzWu/sb-five/main/insta
 1. 将同目录的 `sb` 文件上传到 VPS，例如上传到登录用户的目录。首次运行需要 Python 3。如果系统没有它，先运行 `sudo apt-get update && sudo apt-get install -y python3`。
 2. 在服务器上运行 `sudo python3 ./sb`。输入子域名并选择 IPv4、IPv6 或双栈，再选「全部五个」和各协议端口。保持 TCP 80、443、18443 在首次运行前空闲。
 3. REALITY 选择「本脚本创建的同机 HTTPS 网站」。它会在本机环回地址的 TCP 18443 上提供 HTTPS，公网 TCP 443 的 REALITY 入口会将普通 HTTPS 请求转交给它。网页内容可在安装后编辑 `/var/www/sb-five/index.html`。
-4. 证书选择 ACME 自动签发或导入已有的受信任证书。ACME HTTP 验证需要公网 TCP 80 可达，后续续期也使用这个端口。导入需要完整证书链和对应的私钥，证书必须覆盖所选子域名。
+4. 证书选择 ACME 自动签发或导入已有的受信任证书。选择 ACME 后，可填写自己的邮箱、可收信的邮箱别名，或选择不登记邮箱。ACME HTTP 验证和后续续期需要公网 TCP 80 可达。导入需要完整证书链和对应的私钥，证书必须覆盖所选子域名。
 5. 安装完成后，终端会为每个所选地址族展示五条链接和五个二维码，最后分别展示 sing-box 与 Mihomo 的 HTTPS 聚合订阅。节点使用选中的公网 IP 连接，TLS SNI 和证书仍使用域名。
 
 脚本通过系统包管理器安装 nginx、Certbot、qrencode、OpenSSL 和 nftables。首次安装要求全新 VPS。保留原来的 SSH 连接和云控制台入口。
