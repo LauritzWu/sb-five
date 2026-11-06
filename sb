@@ -42,6 +42,7 @@ PORTS = dict(zip(NAMES, [443, 8444, 443, 10443, 9443]))
 UDP = {"hysteria2", "tuic"}
 BACKEND = 18443
 VERSION = "1.14.4"
+SCRIPT_VERSION = "1.1.0"
 HASHES = {
     "amd64": "699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968",
     "arm64": "436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26",
@@ -74,14 +75,84 @@ def read(path):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def choose(title, options):
-    print(f"\n{title}")
+def paint(value, color):
+    if sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ:
+        return f"\033[{color}m{value}\033[0m"
+    return str(value)
+
+
+def choose(title, options, default=None):
+    print(f"\n{paint(title, '1;36')}")
     for i, label in enumerate(options, 1):
-        print(f"  {i}. {label}")
+        suffix = paint("（回车默认）", "33") if i == default else ""
+        print(f"  {paint(i, '36')}. {label}{suffix}")
+    print(f"  {paint(0, '36')}. 返回 / 退出")
+    prompt = f"请输入数字 [0–{len(options)}]"
+    if default is not None:
+        prompt += f"，回车选 {default}"
     while True:
-        answer = input("数字（0 返回）> ").strip()
+        answer = input(paint(prompt + " > ", "1;33")).strip()
+        if not answer and default is not None:
+            return default
         if answer in {str(i) for i in range(len(options) + 1)}:
             return int(answer)
+        print(paint("请输入菜单里的数字。", "31"))
+
+
+def probe(*args):
+    try:
+        result = subprocess.run(args, text=True, capture_output=True, timeout=3)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def interface_ips():
+    result = {4: [], 6: []}
+    for interface in json.loads(probe("ip", "-j", "address", "show", "scope", "global") or "[]"):
+        for address in interface.get("addr_info", []):
+            ip = ipaddress.ip_address(address["local"])
+            result[ip.version].append(f"{ip}" if ip.is_global else f"{ip}（非公网）")
+    return result
+
+
+def lookup_region():
+    try:
+        with urlopen("https://ipinfo.io/json", timeout=5) as response:
+            data = json.loads(response.read(16384))
+        ip = str(ipaddress.ip_address(data["ip"]))
+        details = ["".join(c for c in str(data.get(field, ""))[:120] if c.isprintable())
+                   for field in ("city", "region", "country", "org")]
+        return f"{ip} · " + " / ".join(filter(None, details))
+    except (OSError, ValueError, KeyError):
+        return "查询失败或服务限流，可稍后重试"
+
+
+def dashboard(state=None, region=None):
+    addresses = interface_ips()
+    system = platform.freedesktop_os_release().get("PRETTY_NAME", platform.system())
+    core = probe(BOX, "version").splitlines()
+    status = probe("systemctl", "is-active", "sb-five.service") == "active"
+    print("\n" + paint("─" * 54, "36"))
+    print(paint(f"sb-five {SCRIPT_VERSION} · VPS 状态", "1;36"))
+    print(f"系统 {paint(system, '34')}  内核 {platform.release()}  架构 {platform.machine()}")
+    print(f"IPv4 网卡地址 {paint('、'.join(addresses[4]) or '未检测到', '35')}")
+    print(f"IPv6 网卡地址 {paint('、'.join(addresses[6]) or '未检测到', '35')}")
+    print(f"出口地区 {paint(region or '未查询，可选菜单查询', '34')}")
+    version = core[0] if core else f"未安装（拟安装 {VERSION}）"
+    print(f"内核版本 {paint(version, '34')}  服务 {paint('运行中' if status else '未运行', '32' if status else '33')}")
+    if state:
+        print("节点地址 " + "  ".join(f"{family.upper()} {paint(ip, '35')}"
+                                    for family, ip in node_addresses(state).items()))
+        for name, port in state["ports"].items():
+            detail = ""
+            if name == "vless":
+                detail = f" · SNI {state['target']['sni']}"
+            elif name == "hysteria2" and state.get("hop"):
+                detail = f" · 跳跃 {state['hop'][0]}–{state['hop'][1]}"
+            print(f"  {paint(NAMES[name], '32')}  {'UDP' if name in UDP else 'TCP'} "
+                  f"{paint(port, '33')}{detail}")
+    print(paint("─" * 54, "36"))
 
 
 def hostname(prompt):
@@ -142,18 +213,20 @@ def uses_ipv6(state):
 
 
 def select_addresses(domain):
-    choice = choose("生成节点地址", ["IPv4", "IPv6", "IPv4 + IPv6"])
+    resolved = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(domain, 443)}
+    versions = {ip.version for ip in resolved if ip.is_global}
+    default = {frozenset({4}): 1, frozenset({6}): 2, frozenset({4, 6}): 3}.get(frozenset(versions))
+    choice = choose("生成节点地址", ["IPv4", "IPv6", "IPv4 + IPv6"], default=default)
     if not choice:
         return None
     families = {4, 6} if choice == 3 else {4 if choice == 1 else 6}
-    resolved = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(domain, 443)}
     addresses = {}
     for version in sorted(families):
         candidates = sorted(ip for ip in resolved if ip.version == version and ip.is_global)
         if not candidates:
             record = "A" if version == 4 else "AAAA"
             raise ValueError(f"{domain} 缺少可用的公网 {record} 记录")
-        index = choose(f"选择节点 IPv{version} 地址", list(map(str, candidates))) if len(candidates) > 1 else 1
+        index = choose(f"选择节点 IPv{version} 地址", list(map(str, candidates)), default=1) if len(candidates) > 1 else 1
         if not index:
             return None
         address = str(candidates[index - 1])
@@ -167,7 +240,8 @@ def select_addresses(domain):
 
 
 def select_port(state, old, name):
-    option = choose(NAMES[name], [f"默认 {PORTS[name]}", "手动输入", "随机空闲端口"])
+    default = 1 if available(state, old, name, PORTS[name]) else 3
+    option = choose(NAMES[name], [f"常用端口 {PORTS[name]}", "手动输入", "随机空闲端口"], default=default)
     if not option:
         return None
     if option == 3:
@@ -525,7 +599,7 @@ def web_group():
 
 
 def acme_contact():
-    selection = choose("ACME 联系邮箱", ["填写自己的邮箱或可收信的邮箱别名", "不登记邮箱"])
+    selection = choose("ACME 联系邮箱", ["填写自己的邮箱或可收信的邮箱别名", "不登记邮箱"], default=1)
     if selection == 0:
         return None
     if selection == 2:
@@ -575,7 +649,7 @@ def managed(domain):
 
 
 def select_target(domain):
-    selection = choose("REALITY 伪装目标", ["本脚本创建的同机 HTTPS 网站", "手动填写 HTTPS 后端"])
+    selection = choose("REALITY 伪装目标", ["本脚本创建的同机 HTTPS 网站", "手动填写 HTTPS 后端"], default=1)
     if selection == 1:
         return managed(domain)
     if selection == 2:
@@ -600,6 +674,15 @@ def show(state):
 
 
 def install():
+    region = None
+    while True:
+        dashboard(region=region)
+        start = choose("安装向导", ["开始配置", "查询出口地区（连接 IPinfo）"], default=1)
+        if start == 0:
+            return
+        if start == 1:
+            break
+        region = lookup_region()
     domain = hostname("节点子域名（A / AAAA 指向 VPS，关闭 CDN 代理）> ")
     addresses = select_addresses(domain)
     if addresses is None:
@@ -616,7 +699,7 @@ def install():
         "auth": {name: str(uuid.uuid4()) if name in {"vless", "vmess", "tuic"}
                  else secrets.token_urlsafe(24) for name in NAMES},
     }
-    selected = choose("启用协议", ["全部五个"] + list(NAMES.values()))
+    selected = choose("启用协议", ["全部五个"] + list(NAMES.values()), default=1)
     if not selected:
         return
     for name in (list(NAMES) if selected == 1 else [list(NAMES)[selected - 2]]):
@@ -632,7 +715,7 @@ def install():
         if state["ports"]["vless"] == 443 and not target["managed"]:
             raise ValueError("外部目标模式需要 VLESS 使用非 443 端口")
         validate_target(state)
-    cert_option = choose("证书", ["ACME 自动签发", "导入现有证书"])
+    cert_option = choose("证书", ["ACME 自动签发", "导入现有证书"], default=1)
     if not cert_option:
         return
     setup(state)
@@ -729,17 +812,20 @@ def main():
         installed = Path("/usr/local/bin/sb")
         if STATE.exists() and Path(__file__).resolve() != installed:
             write(installed, Path(__file__).read_bytes(), 0o755)
+        region = None
         while True:
             try:
                 state = read(STATE)
                 if not state:
                     install()
                     return
+                dashboard(state, region)
                 action = choose(f"sb-five · {state['domain']}", [
                     "启用协议 / 改端口 / 停用", "设置 REALITY 目标", "管理证书",
                     "Hysteria 2 端口跳跃", "IPv4 直出 / 大陆目的地规则",
                     "查看链接 / 二维码 / 聚合订阅", "检查服务与配置", "查看日志",
                     "回滚到上一份配置", "切换 IPv4 / IPv6 节点生成模式",
+                    "查询 / 刷新出口地区（连接 IPinfo）",
                 ])
                 if not action:
                     return
@@ -751,10 +837,12 @@ def main():
                     print("当前端口：", state["ports"], "跳跃：", state["hop"])
                 elif action == 8:
                     run("journalctl", "-u", "sb-five.service", "-n", "60", "--no-pager")
+                elif action == 11:
+                    region = lookup_region()
                 else:
                     edit(state, action)
             except (OSError, ValueError, http.client.HTTPException, subprocess.CalledProcessError) as error:
-                print(f"操作未完成：{error}", file=sys.stderr)
+                print(paint(f"操作未完成：{error}", "31"), file=sys.stderr)
                 if not STATE.exists():
                     sys.exit(1)
 
