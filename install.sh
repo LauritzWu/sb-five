@@ -2,7 +2,7 @@
 set -euo pipefail
 
 main() {
-    local repo="LauritzWu/sb-five" commit="c0f1825cc9defd69c6c6cb060bec262785df78e2"
+    local repo="LauritzWu/sb-five" commit="37950e1ca521f91a9f5937e26efa6a110ff55a15"
     if [[ "$#" -eq 2 ]]; then
         repo="$1"
         commit="$2"
