@@ -42,7 +42,7 @@ PORTS = dict(zip(NAMES, [443, 8444, 443, 10443, 9443]))
 UDP = {"hysteria2", "tuic"}
 BACKEND = 18443
 VERSION = "1.14.4"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 HASHES = {
     "amd64": "699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968",
     "arm64": "436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26",
@@ -81,11 +81,13 @@ def paint(value, color):
     return str(value)
 
 
-def choose(title, options, default=None):
+def choose(title, options, default=None, sections=None):
     print(f"\n{paint(title, '1;36')}")
     for i, label in enumerate(options, 1):
+        if sections and i in sections:
+            print(paint(f"  ── {sections[i]} ──", "1;36"))
         suffix = paint("（回车默认）", "33") if i == default else ""
-        print(f"  {paint(i, '36')}. {label}{suffix}")
+        print(f"  {paint(f'{i:2}', '32')}. {label}{suffix}")
     print(f"  {paint(0, '36')}. 返回 / 退出")
     prompt = f"请输入数字 [0–{len(options)}]"
     if default is not None:
@@ -109,10 +111,25 @@ def probe(*args):
 
 def interface_ips():
     result = {4: [], 6: []}
-    for interface in json.loads(probe("ip", "-j", "address", "show", "scope", "global") or "[]"):
-        for address in interface.get("addr_info", []):
-            ip = ipaddress.ip_address(address["local"])
-            result[ip.version].append(f"{ip}" if ip.is_global else f"{ip}（非公网）")
+    try:
+        interfaces = json.loads(probe("ip", "-j", "address", "show", "scope", "global"))
+    except ValueError:
+        return result
+    if not isinstance(interfaces, list):
+        return result
+    for interface in interfaces:
+        entries = interface.get("addr_info") if isinstance(interface, dict) else None
+        for address in entries if isinstance(entries, list) else []:
+            local = address.get("local") if isinstance(address, dict) else None
+            if not isinstance(local, str):
+                continue
+            try:
+                ip = ipaddress.ip_address(local)
+            except ValueError:
+                continue
+            label = str(ip) if ip.is_global else f"{ip}（非公网）"
+            if label not in result[ip.version]:
+                result[ip.version].append(label)
     return result
 
 
@@ -134,7 +151,7 @@ def dashboard(state=None, region=None):
     core = probe(BOX, "version").splitlines()
     status = probe("systemctl", "is-active", "sb-five.service") == "active"
     print("\n" + paint("─" * 54, "36"))
-    print(paint(f"sb-five {SCRIPT_VERSION} · VPS 状态", "1;36"))
+    print(paint(f"SB FIVE  ·  v{SCRIPT_VERSION}  ·  VPS 状态", "1;36"))
     print(f"系统 {paint(system, '34')}  内核 {platform.release()}  架构 {platform.machine()}")
     print(f"IPv4 网卡地址 {paint('、'.join(addresses[4]) or '未检测到', '35')}")
     print(f"IPv6 网卡地址 {paint('、'.join(addresses[6]) or '未检测到', '35')}")
@@ -826,7 +843,7 @@ def main():
                     "查看链接 / 二维码 / 聚合订阅", "检查服务与配置", "查看日志",
                     "回滚到上一份配置", "切换 IPv4 / IPv6 节点生成模式",
                     "查询 / 刷新出口地区（连接 IPinfo）",
-                ])
+                ], sections={1: "节点配置", 6: "导出与诊断", 9: "维护与网络"})
                 if not action:
                     return
                 if action == 6:

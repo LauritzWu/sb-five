@@ -1,6 +1,6 @@
-# sb 五协议 VPS 脚本
+# SB FIVE · VPS 五协议部署脚本
 
-适用于全新的 Ubuntu 24.04 或 Debian 12 VPS，支持 amd64 和 arm64。服务端使用 sing-box 1.14.4。准备一个独立子域名。IPv4 模式需要 A 记录，IPv6 模式需要 AAAA 记录，双栈模式需要两者。记录指向这台 VPS，使用 Cloudflare DNS 时选择「仅 DNS」。只生成 IPv4 节点时，子域名应仅保留 A 记录。
+同一套 sing-box 运行 VLESS REALITY、VMess WS TLS、Hysteria 2、TUIC v5 和 AnyTLS。节点链接、二维码与订阅在 VPS 本地生成。管理命令为 `sudo sb`。
 
 ## 从 GitHub 一行安装
 
@@ -11,6 +11,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LauritzWu/sb-five/main/insta
 ```
 
 安装入口会下载指定版本的主脚本并打开交互菜单。安装后输入 `sudo sb` 即可重新打开菜单。
+
+## 安装前准备
+
+- 全新的 Ubuntu 24.04 或 Debian 12 VPS，支持 amd64 和 arm64。当前服务端使用 sing-box 1.14.4。
+- 独立子域名。IPv4 模式用 A 记录，IPv6 模式用 AAAA 记录，双栈模式用两者。DNS 记录指向 VPS。使用 Cloudflare DNS 时选择「仅 DNS」。只生成 IPv4 节点时，子域名应仅保留 A 记录。
+- 防火墙放行所选端口。安装前确认 TCP 80、443 和本机 TCP 18443 空闲。
 
 ## 手动安装与配置
 
